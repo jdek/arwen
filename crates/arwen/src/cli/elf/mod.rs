@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::Path;
 
 use arwen_elf::{ElfContainer, ElfError};
@@ -59,14 +60,22 @@ pub fn execute(elf: ElfCommand) -> Result<(), ElfError> {
     }
 }
 
-/// Patch the ELF file at `path`: apply `edit`, then write the result. The file
+/// Patch the ELF file at `path` in place: apply `edit`, then write back only
+/// the bytes that changed. The file keeps its inode, permissions and links, and
 /// is not written to if `edit` or laying out the result fails.
 fn patch(
     path: &Path,
     edit: impl FnOnce(&mut ElfContainer) -> Result<(), ElfError>,
 ) -> Result<(), ElfError> {
-    let bytes = fs::read(path)?;
-    let mut elf = ElfContainer::parse(&bytes)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut elf = ElfContainer::parse(bytes)?;
     edit(&mut elf)?;
-    elf.write_to_path(path)
+    elf.write_changes(&mut file)
+}
+
+/// Read the ELF file at `path`.
+fn read(path: &Path) -> Result<ElfContainer<'static>, ElfError> {
+    ElfContainer::parse(fs::read(path)?)
 }

@@ -1,3 +1,4 @@
+use arwen_elf::consts::PF_X;
 use arwen_elf::ElfContainer;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -26,10 +27,7 @@ impl PyElfContainer {
             PyErr::new::<PyException, _>(format!("Failed to read file {}: {}", path, e))
         })?;
 
-        // Note: This is safe because we're storing the data in the struct
-        let static_data = Box::leak(data.into_boxed_slice());
-
-        let container = ElfContainer::parse(static_data).map_err(PyMachoError::from)?;
+        let container = ElfContainer::parse(data).map_err(PyMachoError::from)?;
 
         Ok(PyElfContainer { inner: container })
     }
@@ -142,7 +140,7 @@ impl PyElfContainer {
     /// Get the OS ABI from the ELF file
     #[pyo3(text_signature = "($self)")]
     fn get_os_abi(&mut self) -> PyResult<u8> {
-        Ok(self.inner.inner.header().os_abi)
+        Ok(self.inner.inner.os_abi())
     }
 
     /// Set the SONAME of the ELF file
@@ -198,7 +196,7 @@ impl PyElfContainer {
             .inner
             .inner
             .elf_gnu_exec_stack()
-            .map(|flag| (flag & object::elf::PF_X) == object::elf::PF_X);
+            .map(|flag| (flag & PF_X) == PF_X);
         Ok(result)
     }
 

@@ -8,6 +8,9 @@
 //   ld -shared -o tests/data/elf/x64/lib/libfoo.so libfoo.o -soname libfoo.so.1 \
 //      --no-as-needed -L<glibc>/lib -ldl -lc -z relro -z now \
 //      -rpath /opt/foo/lib --enable-new-dtags -s
+//
+// tests/data/elf/x64/lib/libfoo-symtab.so is linked the same way without -s, so it
+// keeps its .symtab (built separately, with gcc 15.3 and binutils 2.46).
 #include <dlfcn.h>
 #include <locale.h>
 

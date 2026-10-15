@@ -1,0 +1,2 @@
+GLIBC_2.2.5 { global: setlocale; local: *; };
+GLIBC_2.34 { global: dlopen; } GLIBC_2.2.5;

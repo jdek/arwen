@@ -1,28 +1,24 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::Path,
 };
 
-use object::elf;
-
+use crate::rewriter::consts::*;
 use crate::rewriter::{ElfError, Writer};
 
 pub struct ElfContainer<'a> {
     /// The writer for Elf.
     pub inner: Writer<'a>,
-
-    /// The raw bytes of the ELF file.
-    pub data: Vec<u8>,
 }
 
 impl<'a> ElfContainer<'a> {
     /// Parse the given bytes and return a new `ElfContainer`.
-    pub fn parse(bytes_of_file: &'a [u8]) -> Result<Self, ElfError> {
+    ///
+    /// Borrowed bytes are only copied once the file is modified.
+    pub fn parse(bytes_of_file: impl Into<Cow<'a, [u8]>>) -> Result<Self, ElfError> {
         let rewriter = Writer::read(bytes_of_file)?;
-        Ok(Self {
-            inner: rewriter,
-            data: bytes_of_file.to_vec(),
-        })
+        Ok(Self { inner: rewriter })
     }
 
     /// Add a runpath to the ELF file.
@@ -52,7 +48,7 @@ impl<'a> ElfContainer<'a> {
     /// Prints an empty line if there is none, and fails if the file has no
     /// dynamic section.
     pub fn print_runpath(&mut self) -> Result<(), ElfError> {
-        if self.inner.builder().dynamic_data().is_none() {
+        if !self.inner.has_dynamic() {
             return Err(ElfError::MissingSection(".dynamic"));
         }
         let runpath = self.inner.elf_runpath().unwrap_or_default();
@@ -110,7 +106,7 @@ impl<'a> ElfContainer<'a> {
 
     /// Print the OS ABI in the ELF file.
     pub fn print_os_abi(&mut self) {
-        println!("{}", os_abi_name(self.inner.header().os_abi));
+        println!("{}", os_abi_name(self.inner.os_abi()));
     }
 
     /// Set the SONAME of DT_SONAME.
@@ -214,7 +210,7 @@ impl<'a> ElfContainer<'a> {
     /// `execstack: ?` if there is no `PT_GNU_STACK` segment.
     pub fn print_exec_stack(&mut self) {
         let state = match self.inner.elf_gnu_exec_stack() {
-            Some(flags) if flags & elf::PF_X == elf::PF_X => 'X',
+            Some(flags) if flags & PF_X == PF_X => 'X',
             Some(_) => '-',
             None => '?',
         };
@@ -228,9 +224,7 @@ impl<'a> ElfContainer<'a> {
     ) -> Result<(), ElfError> {
         let symbols = transform_map(symbols);
 
-        self.inner.elf_rename_dynamic_symbols(&symbols);
-
-        Ok(())
+        self.inner.elf_rename_dynamic_symbols(&symbols)
     }
 
     /// Set the page size for ELF file segment alignment.
@@ -249,6 +243,12 @@ impl<'a> ElfContainer<'a> {
         Ok(())
     }
 
+    /// Write only the changed bytes to `file`, which must hold the bytes the
+    /// container was parsed from. See [`Writer::write_changes`].
+    pub fn write_changes(&mut self, file: &mut std::fs::File) -> Result<(), ElfError> {
+        self.inner.write_changes(file)
+    }
+
     pub fn write<W: std::io::Write>(self, w: W) -> Result<(), ElfError> {
         self.inner.write(w)?;
         Ok(())
@@ -257,18 +257,18 @@ impl<'a> ElfContainer<'a> {
 
 pub fn os_abi_name(os_abi: u8) -> String {
     let name = match os_abi {
-        elf::ELFOSABI_SYSV => "System V",
-        elf::ELFOSABI_HPUX => "HP-UX",
-        elf::ELFOSABI_NETBSD => "NetBSD",
-        elf::ELFOSABI_LINUX => "Linux",
-        elf::ELFOSABI_HURD => "GNU Hurd",
-        elf::ELFOSABI_SOLARIS => "Solaris",
-        elf::ELFOSABI_AIX => "AIX",
-        elf::ELFOSABI_IRIX => "IRIX",
-        elf::ELFOSABI_FREEBSD => "FreeBSD",
-        elf::ELFOSABI_TRU64 => "Tru64",
-        elf::ELFOSABI_OPENBSD => "OpenBSD",
-        elf::ELFOSABI_OPENVMS => "OpenVMS",
+        ELFOSABI_SYSV => "System V",
+        ELFOSABI_HPUX => "HP-UX",
+        ELFOSABI_NETBSD => "NetBSD",
+        ELFOSABI_LINUX => "Linux",
+        ELFOSABI_HURD => "GNU Hurd",
+        ELFOSABI_SOLARIS => "Solaris",
+        ELFOSABI_AIX => "AIX",
+        ELFOSABI_IRIX => "IRIX",
+        ELFOSABI_FREEBSD => "FreeBSD",
+        ELFOSABI_TRU64 => "Tru64",
+        ELFOSABI_OPENBSD => "OpenBSD",
+        ELFOSABI_OPENVMS => "OpenVMS",
         _ => return format!("0x{os_abi:02X}"),
     };
     name.to_string()
