@@ -939,6 +939,112 @@ fn test_shrink_rpath_without_search_path() {
     assert!(changed.runpaths.is_empty());
 }
 
+/// Apply the edit `op` (see [`test_sparse_read_matches_full_read`]).
+fn apply(elf: &mut ElfContainer, op: &str, round: usize, defined: Option<&str>) {
+    match op {
+        "a_lot" => modify_a_lot(elf, round, defined),
+        "set_rpath_short" => elf.set_runpath("/x").unwrap(),
+        "set_rpath_long" => elf.set_runpath(format!("/{}", "r".repeat(3000))).unwrap(),
+        "add_needed" => elf.add_needed(vec![format!("libextra{round}.so")]).unwrap(),
+        "remove_needed" => elf.remove_needed(vec!["libdl.so.2"]).unwrap(),
+        // Enough entries that .dynamic moves, with the symbols defined in it.
+        "add_many_needed" => elf
+            .add_needed((0..64).map(|i| format!("libmany{round}_{i}.so")).collect())
+            .unwrap(),
+        "set_interpreter" => {
+            let _ = elf.set_interpreter(&format!("/lib/{}.so", "i".repeat(200)));
+        }
+        "rename" => {
+            let mut names = std::collections::HashMap::new();
+            if let Some(name) = defined {
+                names.insert(
+                    format!("{name}{}", "_r".repeat(round)),
+                    format!("{name}{}", "_r".repeat(round + 1)),
+                );
+            }
+            names.insert("setlocale".to_string(), "setlocale_renamed".to_string());
+            elf.rename_dynamic_symbols(&names).unwrap();
+        }
+        "clear_version" => {
+            let _ = elf.clear_version_symbol("setlocale");
+        }
+        "no_default_lib" => elf.no_default_lib().unwrap(),
+        "set_os_abi" => elf.set_os_abi("freebsd").unwrap(),
+        "page_size" => elf.set_page_size(0x4000).unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+/// Reading only the parts of the file an edit needs gives exactly the file
+/// that reading all of it gives. The bytes not read are poisoned, so that a
+/// read of bytes that were never loaded changes the result.
+#[rstest]
+fn test_sparse_read_matches_full_read(
+    #[files("../../tests/data/elf/*/*/*")]
+    #[files("../../tests/data/elf-big-endian/*/*/*")]
+    bin_path: PathBuf,
+    #[values(
+        "a_lot",
+        "set_rpath_short",
+        "set_rpath_long",
+        "add_needed",
+        "remove_needed",
+        "add_many_needed",
+        "set_interpreter",
+        "rename",
+        "clear_version",
+        "no_default_lib",
+        "set_os_abi",
+        "page_size"
+    )]
+    op: &str,
+    #[values(false, true)] pin: bool,
+) {
+    let mut data_bytes = std::fs::read(&bin_path).unwrap();
+    if pin {
+        pin_section_after_program_headers(&mut data_bytes);
+    }
+    let defined = defined_symbols(&Elf::parse(&data_bytes).unwrap())
+        .into_keys()
+        .find(|name| !name.is_empty());
+    let defined = defined.as_deref();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("patched");
+    std::fs::write(&path, &data_bytes).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+
+    let mut full = ElfContainer::parse(data_bytes.clone()).unwrap();
+    let mut sparse = ElfContainer::read_file_filled(&file, 0xa5).unwrap();
+    assert_eq!(sparse.get_rpath(), full.get_rpath());
+    assert_eq!(sparse.inner.elf_interpreter(), full.inner.elf_interpreter());
+    assert_eq!(sparse.inner.elf_soname(), full.inner.elf_soname());
+    assert_eq!(
+        sparse.inner.elf_needed().collect::<Vec<_>>(),
+        full.inner.elf_needed().collect::<Vec<_>>()
+    );
+    for round in 0..2 {
+        apply(&mut full, op, round, defined);
+        apply(&mut sparse, op, round, defined);
+        sparse.write_changes(&mut file).unwrap();
+        let expected = full.inner.to_bytes().unwrap();
+        assert!(
+            std::fs::read(&path).unwrap() == expected,
+            "{op}, round {round}: reading only what is needed gives a different file"
+        );
+    }
+    // A whole-file write from a sparse writer reads the rest first.
+    let mut sparse = ElfContainer::read_file_filled(&file, 0xa5).unwrap();
+    apply(&mut sparse, op, 2, defined);
+    apply(&mut full, op, 2, defined);
+    let mut out = Vec::new();
+    sparse.write(&mut out).unwrap();
+    assert!(out == full.inner.to_bytes().unwrap(), "{op}: write differs");
+}
+
 /// Extend `DT_RELASZ` (or `DT_RELSZ`) over the PLT relocations that directly
 /// follow, so that both dynamic tags cover them, as some linkers emit. Returns
 /// whether the file has such adjacent tables.
@@ -1223,4 +1329,41 @@ fn test_moved_sections_are_cleared(
         }
     }
     assert!(moved > 0);
+}
+
+/// A string that a symbol name shares is not overwritten in place by a writer
+/// that has not read the symbols yet.
+#[rstest]
+fn test_sparse_read_keeps_shared_strings(
+    #[files("../../tests/data/elf/*/*/*")]
+    #[files("../../tests/data/elf-big-endian/*/*/*")]
+    bin_path: PathBuf,
+) {
+    let data_bytes = std::fs::read(&bin_path).unwrap();
+    let Some(defined) = defined_symbols(&Elf::parse(&data_bytes).unwrap())
+        .into_keys()
+        .find(|name| !name.is_empty())
+    else {
+        return;
+    };
+    // The runpath reuses the symbol name's string.
+    let mut shared = ElfContainer::parse(data_bytes).unwrap();
+    shared.set_runpath(&defined).unwrap();
+    let shared = shared.inner.to_bytes().unwrap().to_vec();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("patched");
+    std::fs::write(&path, &shared).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut sparse = ElfContainer::read_file_filled(&file, 0xa5).unwrap();
+    sparse.set_runpath("/x").unwrap();
+    sparse.write_changes(&mut file).unwrap();
+
+    let mut full = ElfContainer::parse(shared).unwrap();
+    full.set_runpath("/x").unwrap();
+    assert!(std::fs::read(&path).unwrap() == full.inner.to_bytes().unwrap());
 }

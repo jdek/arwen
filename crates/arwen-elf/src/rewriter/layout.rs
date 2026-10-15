@@ -141,6 +141,12 @@ impl Writer<'_> {
     /// and the symbol indices of the dynamic relocations.
     fn rebuild_symbol_hashes(&mut self) -> Result<()> {
         let c = self.codec();
+        self.ensure_dynsym()?;
+        for sh_type in [SHT_GNU_HASH, SHT_HASH, SHT_GNU_VERSYM] {
+            if let Some(i) = self.file.section_by_type(sh_type) {
+                self.ensure_section(i)?;
+            }
+        }
         let count = self.dynsym_count();
         let gnu = self.file.section_by_type(SHT_GNU_HASH);
         let sysv = self.file.section_by_type(SHT_HASH);
@@ -298,6 +304,11 @@ impl Writer<'_> {
                 tables.push((sh.sh_offset, sh.sh_size, ent));
             }
         }
+        let ranges: Vec<_> = tables
+            .iter()
+            .map(|&(offset, size, _)| offset..offset + size)
+            .collect();
+        self.ensure_all(&ranges)?;
         // A table may also be found through the dynamic section; rewrite each
         // entry once.
         tables.retain(|&(_, size, ent)| ent != 0 && size >= ent);
@@ -815,6 +826,11 @@ impl Writer<'_> {
             .copied()
             .collect();
         if relocated.iter().any(Option::is_some) {
+            let ranges: Vec<_> = symbol_tables
+                .iter()
+                .map(|sh| sh.sh_offset..sh.sh_offset + sh.sh_size)
+                .collect();
+            self.ensure_all(&ranges)?;
             let data = self.data.to_mut();
             for table in symbol_tables {
                 let size = c.sym_size();
@@ -954,6 +970,9 @@ impl Writer<'_> {
         }
 
         // 7. Write everything.
+        if let Some((lo, hi)) = block {
+            self.ensure(lo..hi)?;
+        }
         let total = segment_end.max(file_end) as usize;
         let data = self.data.to_mut();
         let dirty = &mut self.dirty;

@@ -21,6 +21,25 @@ impl<'a> ElfContainer<'a> {
         Ok(Self { inner: rewriter })
     }
 
+    /// Read the ELF file `file`, reading only the parts that the queries and
+    /// edits made on the container need. See [`Writer::read_file`].
+    pub fn read_file(file: &std::fs::File) -> Result<ElfContainer<'static>, ElfError> {
+        Ok(ElfContainer {
+            inner: Writer::read_file(file)?,
+        })
+    }
+
+    /// [`ElfContainer::read_file`], with the bytes not read set to `fill`.
+    #[doc(hidden)]
+    pub fn read_file_filled(
+        file: &std::fs::File,
+        fill: u8,
+    ) -> Result<ElfContainer<'static>, ElfError> {
+        Ok(ElfContainer {
+            inner: Writer::read_file_filled(file, fill)?,
+        })
+    }
+
     /// Add a runpath to the ELF file.
     pub fn add_runpath(&mut self, new_runpath: impl AsRef<[u8]>) -> Result<(), ElfError> {
         self.inner

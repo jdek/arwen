@@ -19,6 +19,7 @@ use std::{
 use super::codec::{slice, Codec, Dyn, ProgramHeader, Sym};
 use super::consts::*;
 use super::file::ElfFile;
+use super::source::Source;
 use super::strtab::DynStr;
 use super::{ElfError, Result};
 
@@ -69,6 +70,9 @@ pub struct Writer<'data> {
     /// The length of the file as it was read or last written with
     /// [`Writer::write_changes`].
     synced_len: usize,
+    /// For a writer opened with [`Writer::read_file`]: the file, of which only
+    /// the parts read so far are in `data`.
+    pub(super) source: Option<Source>,
 }
 
 impl fmt::Debug for Writer<'_> {
@@ -86,9 +90,68 @@ impl<'data> Writer<'data> {
     ///
     /// Borrowed data is only copied once the file is modified.
     pub fn read(data: impl Into<Cow<'data, [u8]>>) -> Result<Self> {
-        let data = data.into();
+        Self::new(data.into(), None)
+    }
+
+    /// Read the ELF file `file` and create a new rewriter that reads only the
+    /// parts of the file it needs, as it needs them.
+    ///
+    /// `file` must not change while the writer is in use; to write the changes
+    /// back, open it for writing too and use [`Writer::write_changes`].
+    pub fn read_file(file: &fs::File) -> Result<Writer<'static>> {
+        Self::read_file_filled(file, 0)
+    }
+
+    /// Like [`Writer::read_file`], with the bytes not read yet set to `fill`
+    /// instead of 0. Tests use this to find reads of bytes that were never
+    /// loaded.
+    #[doc(hidden)]
+    pub fn read_file_filled(file: &fs::File, fill: u8) -> Result<Writer<'static>> {
+        let len = file.metadata().map_err(ElfError::Io)?.len();
+        let len_usize = usize::try_from(len)
+            .map_err(|_| ElfError::Unsupported("the file does not fit in memory".into()))?;
+        let source = Source::new(file.try_clone().map_err(ElfError::Io)?, len);
+        // A zeroed allocation this large is mapped lazily: pages that are never
+        // read into or written stay untouched.
+        let data = if fill == 0 {
+            vec![0; len_usize]
+        } else {
+            vec![fill; len_usize]
+        };
+        let mut data = Cow::Owned(data);
+        let mut source = Some(source);
+        // The headers, then the header tables they point to.
+        let ident_len = len.min(64);
+        load(&mut data, &mut source, &[], 0..ident_len)?;
+        if let Some((phdrs, shdrs)) = header_tables(&data, len, false) {
+            load(&mut data, &mut source, &[], phdrs)?;
+            load(&mut data, &mut source, &[], shdrs)?;
+            // With more than SHN_LORESERVE sections, their count is in the first
+            // section header; now that it is read, read the rest.
+            if let Some((_, shdrs)) = header_tables(&data, len, true) {
+                load(&mut data, &mut source, &[], shdrs)?;
+            }
+        }
+        let mut writer = Writer::new(data, source)?;
+        // Small sections that the read-only queries need.
+        let small: Vec<usize> = (0..writer.file.shdrs.len())
+            .filter(|&i| {
+                matches!(
+                    writer.file.shdrs[i].sh_type,
+                    SHT_GNU_VERSYM | SHT_GNU_VERNEED | SHT_GNU_VERDEF
+                ) || Some(i) == writer.file.interp_section()
+            })
+            .collect();
+        for i in small {
+            writer.ensure_section(i)?;
+        }
+        Ok(writer)
+    }
+
+    fn new(data: Cow<'data, [u8]>, source: Option<Source>) -> Result<Self> {
         let file = ElfFile::parse(&data)?;
         let mut writer = Self {
+            source,
             dirty: Vec::new(),
             synced_len: data.len(),
             phdrs: file.phdrs.clone(),
@@ -115,6 +178,7 @@ impl<'data> Writer<'data> {
         };
         let c = self.file.codec;
         let sh = self.file.shdrs[section];
+        self.ensure_section(section)?;
         let bytes = self.file.section_data(&self.data, &sh)?;
         let mut entries = Vec::new();
         let mut rld_map_rel_target = None;
@@ -147,6 +211,7 @@ impl<'data> Writer<'data> {
         };
         if let Some(strtab) = strtab {
             let s = self.file.shdrs[strtab];
+            self.ensure_section(strtab)?;
             slice(&self.data, s.sh_offset, s.sh_size, ".dynstr")?;
             self.dynstr = Some(DynStr {
                 section: strtab,
@@ -166,6 +231,45 @@ impl<'data> Writer<'data> {
 
     pub(super) fn codec(&self) -> Codec {
         self.file.codec
+    }
+
+    /// Make sure the file bytes in `range` are in `data`, for a writer that
+    /// reads only what it needs. Bytes the writer changed are kept.
+    pub(super) fn ensure(&mut self, range: Range<u64>) -> Result<()> {
+        self.ensure_all(&[range])
+    }
+
+    pub(super) fn ensure_all(&mut self, ranges: &[Range<u64>]) -> Result<()> {
+        if self.source.is_none() {
+            return Ok(());
+        }
+        let dirty = merge_ranges(&self.dirty, 0);
+        for range in ranges {
+            load(&mut self.data, &mut self.source, &dirty, range.clone())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn ensure_section(&mut self, index: usize) -> Result<()> {
+        let sh = self.file.shdrs[index];
+        if !sh.has_file_data() {
+            return Ok(());
+        }
+        self.ensure(sh.sh_offset..sh.sh_offset + sh.sh_size)
+    }
+
+    pub(super) fn ensure_dynsym(&mut self) -> Result<()> {
+        match self.dynsym_section() {
+            Some(i) => self.ensure_section(i),
+            None => Ok(()),
+        }
+    }
+
+    fn ensure_everything(&mut self) -> Result<()> {
+        match self.source.as_ref().map(|s| s.len) {
+            Some(len) => self.ensure(0..len),
+            None => Ok(()),
+        }
     }
 
     /// Mutable access to `len` bytes at `at`, which are recorded as changed.
@@ -326,6 +430,8 @@ impl<'data> Writer<'data> {
     /// old string's bytes and `new` fits, the old string is overwritten in place, so
     /// the table does not grow. Otherwise `new` is appended.
     fn replace_string(&mut self, old: Option<u64>, replaced: usize, new: &[u8]) -> Result<u64> {
+        // `string_references` reads the symbol names.
+        self.ensure_dynsym()?;
         let Some(dynstr) = self.dynstr.as_ref() else {
             return Err(ElfError::Modify(
                 "No dynamic string table found; can't store a string".to_string(),
@@ -811,6 +917,7 @@ impl<'data> Writer<'data> {
     ///
     /// Fails if the file has no symbol versions (`.gnu.version`).
     pub fn elf_clear_symbol_version(&mut self, symbol: &str) -> Result<()> {
+        self.ensure_dynsym()?;
         let Some((versym_offset, versym_size)) = self.versym_range() else {
             return Err(ElfError::MissingSection(".gnu.version"));
         };
@@ -884,6 +991,7 @@ impl<'data> Writer<'data> {
     /// The `names` map is from old names to new names. The symbol hash tables
     /// are rebuilt when the file is written.
     pub fn elf_rename_dynamic_symbols(&mut self, names: &HashMap<Vec<u8>, Vec<u8>>) -> Result<()> {
+        self.ensure_dynsym()?;
         for i in 0..self.dynsym_count() {
             let mut sym = self.dynsym(i);
             let Some(new) = self
@@ -906,6 +1014,7 @@ impl<'data> Writer<'data> {
     /// Write the file to an output stream.
     pub fn write<W: io::Write>(mut self, mut w: W) -> Result<()> {
         self.commit()?;
+        self.ensure_everything()?;
         w.write_all(&self.data).map_err(ElfError::Io)?;
         w.flush().map_err(ElfError::Io)
     }
@@ -918,6 +1027,7 @@ impl<'data> Writer<'data> {
     /// hard links. The writer stays usable afterwards.
     pub fn write_to_path(&mut self, path: &Path) -> Result<()> {
         self.commit()?;
+        self.ensure_everything()?;
         fs::write(path, &self.data).map_err(ElfError::Io)
     }
 
@@ -937,8 +1047,15 @@ impl<'data> Writer<'data> {
                 self.synced_len
             )));
         }
-        // Writing the bytes between nearby ranges costs less than another write.
-        for range in merge_ranges(&self.dirty, 4096) {
+        // Writing the bytes between nearby ranges costs less than another
+        // write, but they must be read first.
+        let ranges = merge_ranges(&self.dirty, 4096);
+        let as_u64: Vec<Range<u64>> = ranges
+            .iter()
+            .map(|r| r.start as u64..r.end as u64)
+            .collect();
+        self.ensure_all(&as_u64)?;
+        for range in ranges {
             file.seek(SeekFrom::Start(range.start as u64))
                 .map_err(ElfError::Io)?;
             file.write_all(&self.data[range]).map_err(ElfError::Io)?;
@@ -946,12 +1063,23 @@ impl<'data> Writer<'data> {
         file.flush().map_err(ElfError::Io)?;
         self.dirty.clear();
         self.synced_len = self.data.len();
+        if let Some(source) = &mut self.source {
+            // Everything not read yet is still as in the file, and everything
+            // else is now written.
+            let len = self.data.len() as u64;
+            let old = source.len;
+            source.len = len;
+            if len > old {
+                source.mark(old..len);
+            }
+        }
         Ok(())
     }
 
     /// The bytes of the file, with all modifications applied.
     pub fn to_bytes(&mut self) -> Result<&[u8]> {
         self.commit()?;
+        self.ensure_everything()?;
         Ok(&self.data)
     }
 
@@ -1005,6 +1133,77 @@ impl<'data> Writer<'data> {
         };
         arch.max(linked)
     }
+}
+
+/// Read `range` of the file into `data`, apart from the parts read before and
+/// the `dirty` ranges (sorted and merged), which hold changed bytes.
+fn load(
+    data: &mut Cow<'_, [u8]>,
+    source: &mut Option<Source>,
+    dirty: &[Range<usize>],
+    range: Range<u64>,
+) -> Result<()> {
+    let Some(source) = source.as_mut() else {
+        return Ok(());
+    };
+    let range = range.start.min(source.len)..range.end.min(source.len);
+    for gap in source.missing(range) {
+        let mut at = gap.start;
+        let first = dirty.partition_point(|d| (d.end as u64) <= at);
+        for d in dirty[first..].iter().map(|d| d.start as u64..d.end as u64) {
+            if d.start >= gap.end {
+                break;
+            }
+            if d.start > at {
+                source.read(
+                    at..d.start,
+                    &mut data.to_mut()[at as usize..d.start as usize],
+                )?;
+            }
+            at = at.max(d.end);
+        }
+        if at < gap.end {
+            source.read(
+                at..gap.end,
+                &mut data.to_mut()[at as usize..gap.end as usize],
+            )?;
+        }
+        source.mark(gap);
+    }
+    Ok(())
+}
+
+/// The file ranges of the program and section header tables, from the file
+/// header in `data` (of a file `len` bytes long), if it can be read.
+///
+/// If the header stores no section count, the count is in the first section
+/// header: with `first_read`, it is taken from there, otherwise the range
+/// covers just the first section header.
+fn header_tables(data: &[u8], len: u64, first_read: bool) -> Option<(Range<u64>, Range<u64>)> {
+    if data.len() < 64 || data[..4] != ELFMAG {
+        return None;
+    }
+    let is_64 = data[EI_CLASS] == ELFCLASS64;
+    let le = data[EI_DATA] == ELFDATA2LSB;
+    let c = Codec {
+        is_64,
+        little_endian: le,
+    };
+    let header = super::codec::FileHeader::read(c, &data[..c.file_header_size()]);
+    let phdrs =
+        header.e_phoff..header.e_phoff + u64::from(header.e_phentsize) * u64::from(header.e_phnum);
+    let mut shnum = u64::from(header.e_shnum);
+    let shentsize = u64::from(header.e_shentsize);
+    if shnum == 0 && header.e_shoff != 0 {
+        shnum = 1;
+        if first_read && header.e_shoff + shentsize <= len {
+            let first = &data[header.e_shoff as usize..(header.e_shoff + shentsize) as usize];
+            shnum = super::codec::SectionHeader::read(c, first).sh_size.max(1);
+        }
+    }
+    let shdrs = header.e_shoff..header.e_shoff + shentsize * shnum;
+    let clamp = |r: Range<u64>| r.start.min(len)..r.end.min(len);
+    Some((clamp(phdrs), clamp(shdrs)))
 }
 
 /// Sort and merge byte ranges, also those less than `gap` bytes apart.

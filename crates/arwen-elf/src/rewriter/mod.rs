@@ -13,6 +13,7 @@ mod error;
 mod file;
 mod hash;
 mod layout;
+mod source;
 mod strtab;
 mod writer;
 

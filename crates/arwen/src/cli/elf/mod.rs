@@ -1,5 +1,4 @@
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::path::Path;
 
 use arwen_elf::{ElfContainer, ElfError};
@@ -68,14 +67,12 @@ fn patch(
     edit: impl FnOnce(&mut ElfContainer) -> Result<(), ElfError>,
 ) -> Result<(), ElfError> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let mut elf = ElfContainer::parse(bytes)?;
+    let mut elf = ElfContainer::read_file(&file)?;
     edit(&mut elf)?;
     elf.write_changes(&mut file)
 }
 
-/// Read the ELF file at `path`.
+/// Read the ELF file at `path`, only as far as the queries made on it need.
 fn read(path: &Path) -> Result<ElfContainer<'static>, ElfError> {
-    ElfContainer::parse(fs::read(path)?)
+    ElfContainer::read_file(&fs::File::open(path)?)
 }
