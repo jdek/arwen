@@ -1028,3 +1028,199 @@ fn test_rename_with_overlapping_relocation_tables(
     relocations.sort();
     assert_eq!(dynamic_relocations(&after), relocations);
 }
+
+const FOO_LIB: &str = "../../tests/data/elf/x64/lib/libfoo.so";
+
+/// File offset of the first program header of type `p_type` in a 64-bit file.
+fn program_header_at(data: &[u8], p_type: u32) -> usize {
+    let elf = Elf::parse(data).unwrap();
+    let index = elf
+        .program_headers
+        .iter()
+        .position(|p| p.p_type == p_type)
+        .unwrap();
+    elf.header.e_phoff as usize + index * usize::from(elf.header.e_phentsize)
+}
+
+/// A segment added to a file linked for larger pages is aligned like the
+/// file's other segments.
+#[test]
+fn test_new_segment_keeps_the_load_alignment() {
+    use goblin::elf::program_header::PT_LOAD;
+    let mut data_bytes = std::fs::read(FOO_LIB).unwrap();
+    let before = Elf::parse(&data_bytes).unwrap();
+    let phoff = before.header.e_phoff as usize;
+    let entry = usize::from(before.header.e_phentsize);
+    let loads: Vec<usize> = (0..before.program_headers.len())
+        .filter(|&i| before.program_headers[i].p_type == PT_LOAD)
+        .collect();
+    for &i in &loads {
+        let at = phoff + i * entry + 48;
+        data_bytes[at..at + 8].copy_from_slice(&0x10000u64.to_le_bytes());
+    }
+
+    let mut elf = ElfContainer::parse(&data_bytes).unwrap();
+    elf.set_runpath(format!("/{}", "p".repeat(5000))).unwrap();
+    let mut out = Vec::new();
+    elf.write(&mut out).unwrap();
+
+    let after = Elf::parse(&out).unwrap();
+    let new_loads: Vec<_> = after
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .collect();
+    assert_eq!(new_loads.len(), loads.len() + 1);
+    for p in new_loads {
+        assert_eq!(p.p_align, 0x10000, "{p:?}");
+    }
+    let added = after
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == PT_LOAD)
+        .max_by_key(|p| p.p_vaddr)
+        .unwrap();
+    assert_eq!(added.p_vaddr % 0x10000, added.p_offset % 0x10000);
+}
+
+/// In a separate debug file `.dynamic` is `SHT_NOBITS` and `PT_DYNAMIC` has no
+/// file contents: the search path reads as empty, and edits are refused.
+#[test]
+fn test_dynamic_without_contents() {
+    use goblin::elf::program_header::PT_DYNAMIC;
+    use goblin::elf::section_header::{SHT_DYNAMIC, SHT_NOBITS};
+    let mut data_bytes = std::fs::read(FOO_LIB).unwrap();
+    let elf = Elf::parse(&data_bytes).unwrap();
+    let index = elf
+        .section_headers
+        .iter()
+        .position(|sh| sh.sh_type == SHT_DYNAMIC)
+        .unwrap();
+    let at = elf.header.e_shoff as usize + index * usize::from(elf.header.e_shentsize) + 4;
+    data_bytes[at..at + 4].copy_from_slice(&SHT_NOBITS.to_le_bytes());
+    let at = program_header_at(&data_bytes, PT_DYNAMIC) + 32;
+    data_bytes[at..at + 8].fill(0);
+
+    let mut elf = ElfContainer::parse(&data_bytes).unwrap();
+    assert!(elf.get_rpath().is_empty());
+    elf.print_runpath().unwrap();
+    assert!(elf.set_runpath("/x").is_err());
+}
+
+/// The dynamic section is found by its type when there is no `PT_DYNAMIC`.
+#[test]
+fn test_dynamic_section_without_segment() {
+    use goblin::elf::program_header::{PT_DYNAMIC, PT_NULL};
+    let mut data_bytes = std::fs::read(FOO_LIB).unwrap();
+    let at = program_header_at(&data_bytes, PT_DYNAMIC);
+    data_bytes[at..at + 4].copy_from_slice(&PT_NULL.to_le_bytes());
+
+    let mut elf = ElfContainer::parse(&data_bytes).unwrap();
+    elf.set_runpath("/x").unwrap();
+    let mut out = Vec::new();
+    elf.write(&mut out).unwrap();
+    assert_eq!(ElfContainer::parse(&out).unwrap().get_rpath(), ["/x"]);
+}
+
+/// `shrink-rpath` keeps a directory only if it provides a needed library that
+/// no earlier directory does.
+#[test]
+fn test_shrink_rpath_keeps_the_first_provider() {
+    let library = std::fs::read(FOO_LIB).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dirs: Vec<String> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|d| root.path().join(d).to_str().unwrap().to_owned())
+        .collect();
+    for (dir, libraries) in dirs.iter().zip([
+        &["libone.so"][..],
+        &["libone.so"],
+        &["libone.so", "libtwo.so"],
+        &[],
+    ]) {
+        std::fs::create_dir(dir).unwrap();
+        for name in libraries {
+            std::fs::write(PathBuf::from(dir).join(name), &library).unwrap();
+        }
+    }
+
+    let mut elf = ElfContainer::parse(&library[..]).unwrap();
+    elf.add_needed(vec!["libone.so", "libtwo.so"]).unwrap();
+    elf.set_runpath(format!("{}:$ORIGIN", dirs.join(":")))
+        .unwrap();
+    let mut out = Vec::new();
+    elf.write(&mut out).unwrap();
+    let mut elf = ElfContainer::parse(&out[..]).unwrap();
+    elf.shrink_rpath(Vec::new()).unwrap();
+    let mut shrunk = Vec::new();
+    elf.write(&mut shrunk).unwrap();
+
+    assert_eq!(
+        ElfContainer::parse(&shrunk).unwrap().get_rpath(),
+        [dirs[0].as_str(), dirs[2].as_str(), "$ORIGIN"]
+    );
+}
+
+/// Sections that move leave zeros behind, apart from bytes that the headers
+/// or other sections still use.
+#[rstest]
+fn test_moved_sections_are_cleared(
+    #[files("../../tests/data/elf/*/*/*")]
+    #[files("../../tests/data/elf-big-endian/*/*/*")]
+    bin_path: PathBuf,
+) {
+    use goblin::elf::section_header::{SHT_DYNAMIC, SHT_NOBITS, SHT_NULL};
+    let data_bytes = std::fs::read(&bin_path).unwrap();
+    let before = Elf::parse(&data_bytes).unwrap();
+    let mut elf = ElfContainer::parse(&data_bytes).unwrap();
+    elf.set_runpath(format!("/{}", "p".repeat(5000))).unwrap();
+    let mut out = Vec::new();
+    elf.write(&mut out).unwrap();
+    let after = Elf::parse(&out).unwrap();
+
+    let has_data = |sh: &&goblin::elf::SectionHeader| {
+        sh.sh_type != SHT_NOBITS && sh.sh_type != SHT_NULL && sh.sh_size > 0
+    };
+    let dynamic = |elf: &Elf| {
+        elf.section_headers
+            .iter()
+            .find(|sh| sh.sh_type == SHT_DYNAMIC)
+            .map(|sh| sh.sh_offset)
+    };
+    // The old copy of a moved `.dynamic` stays, and with it what it points at.
+    if dynamic(&before) != dynamic(&after) {
+        return;
+    }
+    let header = &after.header;
+    let mut used: Vec<std::ops::Range<u64>> = after
+        .section_headers
+        .iter()
+        .filter(has_data)
+        .map(|sh| sh.sh_offset..sh.sh_offset + sh.sh_size)
+        .collect();
+    used.push(0..u64::from(header.e_ehsize));
+    used.push(
+        header.e_phoff..header.e_phoff + u64::from(header.e_phentsize) * u64::from(header.e_phnum),
+    );
+    used.push(
+        header.e_shoff..header.e_shoff + u64::from(header.e_shentsize) * u64::from(header.e_shnum),
+    );
+
+    let mut moved = 0;
+    for (old, new) in before.section_headers.iter().zip(&after.section_headers) {
+        if !has_data(&old) || old.sh_offset == new.sh_offset {
+            continue;
+        }
+        moved += 1;
+        for at in old.sh_offset..old.sh_offset + old.sh_size {
+            if !used.iter().any(|r| r.contains(&at)) {
+                assert_eq!(
+                    out[at as usize], 0,
+                    "byte {at:#x} of the old section at {:#x}",
+                    old.sh_offset
+                );
+            }
+        }
+    }
+    assert!(moved > 0);
+}

@@ -184,9 +184,10 @@ impl<'data> Writer<'data> {
         self.dynstr.as_ref()?.get(&self.data, offset)
     }
 
-    /// Whether the file has a dynamic section.
+    /// Whether the file has a dynamic section. A `PT_DYNAMIC` whose contents
+    /// were stripped (as in separate debug files) counts as an empty one.
     pub fn has_dynamic(&self) -> bool {
-        self.dynamic.is_some()
+        self.dynamic.is_some() || self.file.segment(PT_DYNAMIC).is_some()
     }
 
     pub(super) fn entries(&self) -> &[Dyn] {
@@ -740,7 +741,9 @@ impl<'data> Writer<'data> {
             let rpath_str = String::from_utf8_lossy(rpath).into_owned();
             let mut rpath_vec: Vec<&str> = rpath_str.split(':').collect();
 
-            // Check if each directory contains a library referenced by DT_NEEDED
+            // Keep a directory only if it provides a needed library that no
+            // earlier directory does.
+            let mut found: HashSet<&[u8]> = HashSet::new();
             rpath_vec.retain(|&dir| {
                 let dir_path = Path::new(dir);
 
@@ -759,19 +762,26 @@ impl<'data> Writer<'data> {
                     return false;
                 }
 
+                let mut provides = false;
                 for lib_needed in needed_libraries.iter() {
-                    let Ok(possible_library) = String::from_utf8(lib_needed.to_vec()) else {
+                    if found.contains(lib_needed.as_slice()) {
+                        continue;
+                    }
+                    let Ok(possible_library) = std::str::from_utf8(lib_needed) else {
                         continue;
                     };
                     let Ok(file_content) = fs::read(dir_path.join(possible_library)) else {
                         continue;
                     };
                     if elf_machine(&file_content) == Some(e_machine) {
-                        return true;
+                        found.insert(lib_needed);
+                        provides = true;
                     }
                 }
-                eprintln!("Removing directory {dir}");
-                false
+                if !provides {
+                    eprintln!("Removing directory {dir}");
+                }
+                provides
             });
 
             eprintln!("New rpath: {rpath_vec:?}");
@@ -973,8 +983,18 @@ impl<'data> Writer<'data> {
             return page_size;
         }
 
-        // The largest page size each architecture supports.
-        match self.file.header.e_machine {
+        // The largest page size each architecture supports, or the alignment of
+        // the existing segments if the file was linked for larger pages.
+        let linked = self
+            .file
+            .phdrs
+            .iter()
+            .filter(|p| p.p_type == PT_LOAD && p.p_align.is_power_of_two())
+            .map(|p| p.p_align)
+            .max()
+            .unwrap_or(0)
+            .min(1 << 31) as u32;
+        let arch = match self.file.header.e_machine {
             // 65536
             EM_ALPHA | EM_IA_64 | EM_MIPS | EM_PPC | EM_PPC64 | EM_AARCH64 | EM_TILEGX
             | EM_LOONGARCH => 0x10000,
@@ -982,7 +1002,8 @@ impl<'data> Writer<'data> {
             EM_SPARC | EM_SPARCV9 => 0x2000,
             // 4096 (default)
             _ => 0x1000,
-        }
+        };
+        arch.max(linked)
     }
 }
 

@@ -154,10 +154,11 @@ impl ElfFile {
         self.phdrs.iter().find(|ph| ph.p_type == p_type)
     }
 
-    /// The section holding the dynamic table, found through `PT_DYNAMIC`.
+    /// The section holding the dynamic table, found through `PT_DYNAMIC` or,
+    /// failing that, by its type.
     pub fn dynamic_section(&self) -> Option<usize> {
-        let segment = self.segment(PT_DYNAMIC)?;
-        self.section_at_offset(segment.p_offset, Some(SHT_DYNAMIC))
+        self.segment(PT_DYNAMIC)
+            .and_then(|segment| self.section_at_offset(segment.p_offset, Some(SHT_DYNAMIC)))
             .or_else(|| self.section_by_type(SHT_DYNAMIC))
     }
 

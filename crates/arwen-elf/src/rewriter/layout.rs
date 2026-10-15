@@ -980,6 +980,36 @@ impl Writer<'_> {
             data.copy_within(lo as usize..hi as usize, to);
             dirty.push(to..to + (hi - lo) as usize);
         }
+        // Clear what moved sections leave behind, so that nothing reading the
+        // old place finds stale tables. Not when `.dynamic` moves: its old copy
+        // stays in use (see the limitation above) and points at them.
+        if !dynamic_moves {
+            let mut vacated: Vec<(u64, u64)> = moved
+                .iter()
+                .map(|&i| old_shdrs[i])
+                .filter(SectionHeader::has_file_data)
+                .map(|sh| (sh.sh_offset, sh.sh_offset + sh.sh_size))
+                .chain(block)
+                .collect();
+            for sh in new_shdrs
+                .iter()
+                .filter(|sh| sh.has_file_data() && sh.sh_size > 0)
+            {
+                let (lo, hi) = (sh.sh_offset, sh.sh_offset + sh.sh_size);
+                vacated = vacated
+                    .into_iter()
+                    .flat_map(|(a, b)| [(a, b.min(lo)), (a.max(hi), b)])
+                    .filter(|(a, b)| a < b)
+                    .collect();
+            }
+            for (lo, hi) in vacated {
+                let range = lo as usize..(hi as usize).min(data_len as usize);
+                if !range.is_empty() {
+                    data[range.clone()].fill(0);
+                    dirty.push(range);
+                }
+            }
+        }
         for &i in &moved {
             let edit = edits.iter().find(|e| e.section == i).unwrap();
             if let Some(contents) = &edit.contents {
