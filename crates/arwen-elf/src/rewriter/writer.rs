@@ -11,7 +11,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fmt, fs,
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::Path,
 };
@@ -876,10 +876,14 @@ impl<'data> Writer<'data> {
                     let Ok(possible_library) = std::str::from_utf8(lib_needed) else {
                         continue;
                     };
-                    let Ok(file_content) = fs::read(dir_path.join(possible_library)) else {
+                    // The machine is in the first 20 bytes; libraries can be large.
+                    let mut header = [0; 20];
+                    let Ok(()) = fs::File::open(dir_path.join(possible_library))
+                        .and_then(|mut file| file.read_exact(&mut header))
+                    else {
                         continue;
                     };
-                    if elf_machine(&file_content) == Some(e_machine) {
+                    if elf_machine(&header) == Some(e_machine) {
                         found.insert(lib_needed);
                         provides = true;
                     }
