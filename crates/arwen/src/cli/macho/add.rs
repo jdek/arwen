@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use arwen_macho::{MachoContainer, MachoError};
+use arwen_macho::MachoError;
 
 /// Add a run path
 #[derive(Parser, Debug)]
@@ -15,13 +15,8 @@ pub struct Args {
 }
 
 pub fn execute(args: Args) -> Result<(), MachoError> {
-    let bytes_of_file = std::fs::read(&args.path_to_binary).unwrap();
-
-    let mut macho = MachoContainer::parse(&bytes_of_file)?;
-
-    macho.add_rpath(&args.new_rpath)?;
-
-    std::fs::write(args.path_to_binary, macho.data).unwrap();
-
-    Ok(())
+    super::patch(&args.path_to_binary, |macho| {
+        macho.add_rpath(&args.new_rpath)?;
+        Ok(())
+    })
 }

@@ -6,7 +6,6 @@
 pub mod commands;
 pub mod container;
 pub mod error;
-pub mod patcher;
 mod utils;
 
 pub use container::*;
