@@ -10,9 +10,7 @@ pub struct Args {
 }
 
 pub fn execute(args: Args) -> Result<(), arwen_elf::ElfError> {
-    let bytes_of_file = std::fs::read(&args.path_to_binary).unwrap();
-
-    let mut elf = arwen_elf::ElfContainer::parse(&bytes_of_file)?;
+    let mut elf = super::read(&args.path_to_binary)?;
 
     elf.print_needed();
 

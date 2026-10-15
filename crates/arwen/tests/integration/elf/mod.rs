@@ -15,6 +15,7 @@ use tempfile::tempdir;
 
 use crate::common::ARWEN;
 
+mod big_endian;
 mod write;
 
 /// Replaced by the path of the binary being modified.
@@ -447,16 +448,18 @@ fn add_needed_existing_is_not_duplicated(
     #[files("../../tests/data/elf/*/lib/*")]
     bin: PathBuf,
 ) {
+    let before = ElfSummary::read(&bin);
+    // A file without DT_NEEDED has nothing to add again.
+    let Some(existing) = before.needed.first() else {
+        return;
+    };
     let dir = tempdir().unwrap();
     let (file, args) = prepare(
         &bin,
         dir.path(),
         "arwen.bin",
-        &["add-needed", FILE, "libc.so.6"],
+        &["add-needed", FILE, existing],
     );
-
-    let before = ElfSummary::read(&file);
-    assert!(before.needed.iter().any(|lib| lib == "libc.so.6"));
 
     let args: Vec<String> = ["elf".to_string()].into_iter().chain(args).collect();
     run(ARWEN, &args);

@@ -14,7 +14,7 @@ ignored = ["arwen-core"]
 
 [dependencies]
 arwen-core = { workspace = true }
-object = { workspace = true }
+memchr = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

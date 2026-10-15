@@ -24,10 +24,7 @@ impl PyMachoContainer {
             PyErr::new::<PyException, _>(format!("Failed to read file {}: {}", path, e))
         })?;
 
-        // Note: This is safe because we're storing the data in the struct
-        let static_data = Box::leak(data.into_boxed_slice());
-
-        let container = MachoContainer::parse(static_data).map_err(PyMachoError::from)?;
+        let container = MachoContainer::parse(data).map_err(PyMachoError::from)?;
 
         Ok(PyMachoContainer { inner: container })
     }
